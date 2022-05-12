@@ -34,6 +34,7 @@ impl AsRef<str> for PathElement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathParser {
     elements: Vec<PathElement>,
+    nr_of_slashes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,10 +44,16 @@ pub enum PathParserError {
     Internal,
     /// Deserializing with the help of [`serde_json`] failed.
     JsonParseError,
+    /// A path was empty.
+    EmptyPath,
+    /// A path did not start with a slash.
+    NoSlashAtTheBeginning,
     /// A path element which did not end in a slash contained a slash, which is not permitted.
     InvalidSlash,
     /// The parser expected more path elements, but the provided path did not contain them.
     UnexpectedEndOfPath,
+    /// The parser detected that the to be parsed path did not contain the right number of slashes.
+    InvalidNumberOfSlashes,
 }
 
 impl PathParser {
@@ -54,11 +61,41 @@ impl PathParser {
         &self.elements
     }
 
+    pub fn nr_of_slashes(&self) -> usize {
+        self.nr_of_slashes
+    }
+
+    pub fn is_path_appropriate(&self, path: impl AsRef<str>) -> bool {
+        let path = path.as_ref();
+
+        let (_, nr_of_slashes) = match Self::normalize_and_count_slashes(path) {
+            Ok(tuple) => tuple,
+            Err(_) => return false,
+        };
+
+        // Make sure the path has the correct number of slashes.
+        // If not, another path might be more appropriate.
+        if nr_of_slashes != self.nr_of_slashes {
+            return false
+        }
+
+        true
+    }
+
     pub fn parse<T>(&self, path: impl AsRef<str>) -> Result<T, PathParserError>
     where
         T: DeserializeOwned,
     {
-        let mut path = path.as_ref();
+        let path = path.as_ref();
+
+        let (mut path, nr_of_slashes) = Self::normalize_and_count_slashes(path)?;
+
+        // We only check if the provided path can be parsed.
+        // It MAY have more slashes then this path. This might be usefull for
+        // handling a regular path after a dynamic prefix (e.g. /{userid}/html/path/to/file.html)
+        if self.nr_of_slashes > nr_of_slashes {
+            return Err(PathParserError::InvalidNumberOfSlashes);
+        }
 
         let mut map = Map::with_capacity(self.elements.len()/2);
 
@@ -148,15 +185,36 @@ impl PathParser {
 
         Value::String(s.into())
     }
+
+    /// Makes sure the path starts with a slash, removes the trailing one if necessary
+    /// and counts the number of slashes afterwards.
+    fn normalize_and_count_slashes(path: &str) -> Result<(&str, usize), PathParserError> {
+        // Check that the path starts with a slash.
+        if path.chars().nth(0).ok_or(PathParserError::EmptyPath)? != '/' {
+            return Err(PathParserError::NoSlashAtTheBeginning);
+        }
+
+        // Remove the trailing slash, if any.
+        let path = path.strip_suffix("/").unwrap_or(path);
+
+        // Count the number of slashes (= the number of regular elements)
+        let mut nr_of_slashes = 0;
+        for ch in path.chars() {
+            if ch == '/' {
+                nr_of_slashes += 1;
+            }
+        }
+
+        Ok((path, nr_of_slashes))
+    }
 }
 
 impl FromStr for PathParser {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.chars().nth(0).ok_or_else(|| ())?!='/' {
-            return Err(());
-        }
+
+        let (s, nr_of_slashes) = Self::normalize_and_count_slashes(s).map_err(|_| ())?;
 
         let mut elements = Vec::new();
 
@@ -215,6 +273,7 @@ impl FromStr for PathParser {
 
         Ok(Self {
             elements,
+            nr_of_slashes,
         })
     }
 }
@@ -318,7 +377,10 @@ mod tests {
             PathElement::Fixed("/home/user1".into()),
         ];
 
-        let compare = PathParser{elements};
+        let compare = PathParser{
+            elements,
+            nr_of_slashes: 2,
+        };
 
         assert_eq!(parser, compare);
 
@@ -334,14 +396,17 @@ mod tests {
             PathElement::Variable("user".into())
         ];
 
-        let compare = PathParser{elements};
+        let compare = PathParser{
+            elements,
+            nr_of_slashes: 2,
+        };
 
         assert_eq!(parser, compare);
     }
 
     #[test]
     fn path_parser_parse_long() {
-        let parser = PathParser::from_str("/home/{user}/folder{folderid}").unwrap();
+        let parser = PathParser::from_str("/home/{user}/folder{folderid}/").unwrap();
 
         let elements = vec![
             PathElement::Fixed("/home/".into()),
@@ -350,7 +415,10 @@ mod tests {
             PathElement::Variable("folderid".into()),
         ];
 
-        let compare = PathParser{elements};
+        let compare = PathParser{
+            elements,
+            nr_of_slashes: 3,
+        };
 
         assert_eq!(parser, compare);
     }
@@ -363,7 +431,7 @@ mod tests {
 
     #[test]
     fn path_parser_parse_path() {
-        let parser = PathParser::from_str("/home/{user}/folder{folderid}").unwrap();
+        let parser = PathParser::from_str("/home/{user}/folder{folderid}/").unwrap();
 
         let parsed: PathParserTest = parser.parse("/home/alfred/folder123").unwrap();
 
